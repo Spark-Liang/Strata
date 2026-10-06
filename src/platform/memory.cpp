@@ -9,7 +9,21 @@
 #include <cstring>
 #else
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+#include <cerrno>
+#include <cstring>
+#if defined(__has_include)
+#if __has_include(<linux/mempolicy.h>)
+#include <linux/mempolicy.h>
+#endif
+#endif
+#ifndef MPOL_BIND
+#define MPOL_BIND 2   // the UAPI value; only used when the header above is unavailable
+#endif
+#ifndef MPOL_DEFAULT
+#define MPOL_DEFAULT 0
+#endif
 #endif
 
 namespace strata::platform {
@@ -108,6 +122,12 @@ uint64_t total_physical_memory() {
     ms.dwLength = sizeof ms;
     return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullTotalPhys : 0;
 }
+
+bool bind_memory_node(int node, std::string& why) {
+    (void) node;
+    why = "memory node binding is Linux-only";
+    return false;
+}
 #else
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
@@ -132,6 +152,23 @@ bool gpu_shared_memory_budget(const void*, uint64_t& budget, uint64_t& usage, st
 uint64_t total_physical_memory() {
     const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
     return pages > 0 && page > 0 ? (uint64_t) pages * (uint64_t) page : 0;
+}
+
+bool bind_memory_node(int node, std::string& why) {
+    static constexpr unsigned long kMaxNode = 1024;
+    unsigned long mask[kMaxNode / (8 * sizeof(unsigned long))] = {0};
+    if (node >= 0) {
+        if ((unsigned long) node >= kMaxNode) { why = "node index out of range"; return false; }
+        mask[(unsigned long) node / (8 * sizeof(unsigned long))] |=
+            1ul << ((unsigned long) node % (8 * sizeof(unsigned long)));
+    }
+    const int mode = node >= 0 ? MPOL_BIND : MPOL_DEFAULT;
+    if (syscall(SYS_set_mempolicy, mode, node >= 0 ? mask : nullptr, kMaxNode) != 0) {
+        why = std::string("set_mempolicy failed: ") + std::strerror(errno);
+        return false;
+    }
+    why = node >= 0 ? ("MPOL_BIND node " + std::to_string(node)) : std::string("MPOL_DEFAULT");
+    return true;
 }
 #endif
 

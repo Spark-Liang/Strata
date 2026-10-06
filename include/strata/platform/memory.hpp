@@ -32,6 +32,12 @@ bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usag
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 
+/// L1 NUMA: bind the calling process's memory policy to one node (MPOL_BIND), so host allocations that do not
+/// set a policy of their own - CUDA host buffers (`cudaHostAlloc`), KV staging, weight shadows - land on the
+/// GPU's node.  `node` < 0 restores the default policy.  False with a reason when the platform or the kernel
+/// refuses (Windows, a cpuset that excludes the node); the caller reports it and continues.
+bool bind_memory_node(int node, std::string& why);
+
 /// #357/#577: whether the OS file cache could keep the `read_bytes` the expert files are read for, beside
 /// `arena_bytes` of RAM held by the engine's own copy of the experts and `margin` for everything else, with `avail`
 /// bytes of RAM available.  The file tier passes only the expert bytes it really reads from the files (the experts
