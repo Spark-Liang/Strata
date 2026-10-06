@@ -22,6 +22,7 @@
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/pinned.hpp"
+#include "strata/platform/memory.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -2641,12 +2642,14 @@ int main(int argc, char** argv) {
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
 
     std::vector<std::pair<int32_t, int32_t>> profile;
+    int64_t profile_slots = 0;   // L1 NUMA: the hot-set size the profile was built for (VRAM cache slots)
     if (!o.expert_profile.empty()) {
         int64_t pslots = 0;
         if (!strata::core::read_expert_profile(o.expert_profile, g.n_layers, g.n_expert, profile, pslots, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        profile_slots = pslots;
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the
         // file).  `--expert-cache 0` used to take the count the profile was built for; the profile now ranks
         // every pair (issue #46: a card that holds more than the old 8,000 used to stop there), so it means auto.
@@ -3159,6 +3162,32 @@ int main(int argc, char** argv) {
         else if (pin_wddm_cap)
             std::fprintf(stderr, "strata generate: multi-GPU under WDDM: at most 8 GiB of the expert arena is pinned "
                                  "(STRATA_ARENA_PIN_GIB changes it)\n");
+        // L1 NUMA: STRATA_NUMA_PARTITION=1 splits the expert arena over the two nodes and lets the pool claim per
+        // node.  Host allocations without a policy of their own (CUDA staging, KV streaming, weight shadows) are
+        // bound to node 0, where the GPU is; each arena binds itself to its own node inside ArenaExpertSource.
+        static const bool numa_partition = [] {
+            const char* v = std::getenv("STRATA_NUMA_PARTITION");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        // Hot set = the pairs the VRAM cache fills first: the profile's first `profile_slots` ranks.  The
+        // learned profile ranks EVERY pair, and biasing all of them would leave no swap candidate, so the list
+        // is truncated here (and build_expert_placement caps it per layer as a second guard).  Declared outside
+        // the `if` so it outlives `open()`; only `set_partition`/`open` read it.
+        std::vector<std::pair<int32_t, int32_t>> hot_pairs;
+        if (numa_partition) {
+            std::string nwhy;
+            if (strata::platform::bind_memory_node(0, nwhy))
+                std::fprintf(stderr, "strata generate: NUMA partition on: host allocations bound to node 0 (%s)\n",
+                             nwhy.c_str());
+            else
+                std::fprintf(stderr, "strata generate: NUMA partition: host allocations stay unbound (%s)\n",
+                             nwhy.c_str());
+            if (!profile.empty() && profile_slots > 0) {
+                const size_t n_hot = std::min<size_t>(profile.size(), (size_t) profile_slots);
+                hot_pairs.assign(profile.begin(), profile.begin() + (std::ptrdiff_t) n_hot);
+            }
+            arena_src.set_partition(2, hot_pairs.empty() ? nullptr : &hot_pairs);
+        }
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -3167,6 +3196,10 @@ int main(int argc, char** argv) {
         if (!arena_src.ram_warning().empty())   // #633: said before the load's numbers, which it explains
             std::fprintf(stderr, "strata generate: WARNING: %s\n", arena_src.ram_warning().c_str());
         std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
+        if (arena_src.partitioned())
+            std::fprintf(stderr, "strata generate: expert arena partitioned: node0 %.2f GiB, node1 %.2f GiB\n",
+                         (double) arena_src.node_bytes(0) / 1073741824.0,
+                         (double) arena_src.node_bytes(1) / 1073741824.0);
         std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
                      (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
@@ -3188,6 +3221,10 @@ int main(int argc, char** argv) {
         srcp = &arena_src;
     }
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker, o.pool_affinity);
+    if (pool.nodes() > 1)
+        std::fprintf(stderr, "strata generate: expert pool over %d NUMA nodes: %d workers on node0, %d on node1%s\n",
+                     pool.nodes(), pool.node_workers(0), pool.node_workers(1),
+                     pool.host_works() ? " (host participates)" : "");
     if (pool.is_hybrid() && pool.affinity() != strata::kernels::cpu::PoolAffinity::All) {
         const char* aff_str = pool.affinity() == strata::kernels::cpu::PoolAffinity::PCores ? "p-cores" :
                               pool.affinity() == strata::kernels::cpu::PoolAffinity::All ? "all" : "auto";
