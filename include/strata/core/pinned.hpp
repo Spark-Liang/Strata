@@ -38,10 +38,13 @@ struct PinnedArena {
     uint64_t registered_bytes = 0;
     uint64_t slice_bytes = 0;
     int registered_slices = 0;
+    /// L1 NUMA: the node this arena's pages are bound to (-1 = the allocator's default policy).
+    int numa_node = -1;
 
     PinnedArena() = default;
-    /// `slice`: the piece size for the per-slice registration fallback (0 = none).
-    explicit PinnedArena(uint64_t bytes, uint64_t slice = 0);
+    /// `slice`: the piece size for the per-slice registration fallback (0 = none).  `bind_node` >= 0 binds the
+    /// mapping (MAP_HUGETLB pages included) to that NUMA node's memory before any page is touched.
+    explicit PinnedArena(uint64_t bytes, uint64_t slice = 0, int bind_node = -1);
     /// Plan v0.3 P6: slices of different sizes (one per layer of a native pack), given as their start offsets
     /// followed by the end of the last one.  `slice_starts` holds the registered ones.
     /// `max_pinned_bytes`: optional cap on CUDA registration. 0 preserves the normal unrestricted path.
@@ -50,7 +53,7 @@ struct PinnedArena {
     /// small header and is refused when its stored hash does not match.  Empty `shared_file` preserves the
     /// existing allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes = 0,
-                const std::string& shared_file = {}, uint64_t shared_pack_hash = 0);
+                const std::string& shared_file = {}, uint64_t shared_pack_hash = 0, int bind_node = -1);
     std::vector<uint64_t> slice_starts;
     void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
     uint64_t mapping_bytes = 0;       ///< bytes to release from mapping_base

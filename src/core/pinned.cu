@@ -27,8 +27,17 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <linux/mman.h>
+#if defined(__has_include)
+#if __has_include(<linux/mempolicy.h>)
+#include <linux/mempolicy.h>
+#endif
+#endif
+#ifndef MPOL_BIND
+#define MPOL_BIND 2   // the UAPI value; only used when the header above is unavailable
+#endif
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
 #endif
@@ -51,12 +60,43 @@ struct SharedArenaHeader {
 };
 static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
 
+#if !defined(_WIN32)
+// L1 NUMA: bind the calling thread's memory policy to one node for the duration of a mapping, so the vma
+// inherits it and its pages (the hugetlb pool included) are taken from that node.  get/set_mempolicy go through
+// syscall() so no libnuma dependency is added.  Never fatal: a refused policy leaves the allocator's default.
+class ScopedNodePolicy {
+public:
+    explicit ScopedNodePolicy(int node) {
+        if (node < 0) return;
+        static constexpr unsigned long kMaxNode = 1024;
+        int mode = 0;
+        unsigned long old[kMaxNode / (8 * sizeof(unsigned long))] = {0};
+        if (syscall(SYS_get_mempolicy, &mode, old, kMaxNode, nullptr, 0) != 0) return;
+        unsigned long mask[kMaxNode / (8 * sizeof(unsigned long))] = {0};
+        mask[(unsigned long) node / (8 * sizeof(unsigned long))] |=
+            1ul << ((unsigned long) node % (8 * sizeof(unsigned long)));
+        if (syscall(SYS_set_mempolicy, MPOL_BIND, mask, kMaxNode) != 0) return;
+        for (size_t i = 0; i < kMaxNode / (8 * sizeof(unsigned long)); ++i) old_[i] = old[i];
+        old_mode_ = mode;
+        armed_ = true;
+    }
+    ~ScopedNodePolicy() {
+        if (armed_) syscall(SYS_set_mempolicy, old_mode_, old_, 1024);
+    }
+    bool armed() const { return armed_; }
+private:
+    unsigned long old_[1024 / (8 * sizeof(unsigned long))] = {0};
+    int old_mode_ = 0;
+    bool armed_ = false;
+};
+#endif
+
 // A 2 MB-aligned reservation.  Large pages first, then the largest alignment the OS will give us for free.
 // A non-empty shared_file instead maps one file whose first 4 KiB identify the pack and whose remaining bytes
 // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
 // hugepage-aligned file size and arena offset rather than the 4 KiB header layout used here.
 void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::string& shared_file,
-              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes, int bind_node) {
     mapping_base = nullptr;
     mapping_bytes = 0;
 #ifdef _WIN32
@@ -201,6 +241,9 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
 
     // STRATA_NO_LARGEPAGES=1 is the same-run A/B switch the Windows branch documents; honor it
     // here too, so the large-page path can be compared without changing the pool or rebooting.
+    // L1 NUMA: the policy is set before EITHER mmap and restored at return, so the hugetlb pool pages and the
+    // anonymous fallback pages both come from `bind_node` while every later allocation keeps its own policy.
+    ScopedNodePolicy node_policy(bind_node);
     if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr) {
         note = "large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages";
     } else {
@@ -324,15 +367,17 @@ std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
 }
 }  // namespace
 
-PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
+PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, int bind_node)
+    : PinnedArena(bytes, uniform_bounds(bytes, slice), 0, {}, 0, bind_node) {
     if (slice_bytes) slice_bytes = slice;   // sliced registration: record the uniform size
 }
 
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t max_pinned_bytes, const std::string& shared_file,
-                         uint64_t shared_pack_hash) : capacity(bytes) {
+                         uint64_t shared_pack_hash, int bind_node) : capacity(bytes) {
+    numa_node = bind_node;
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes, bind_node);
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
@@ -424,6 +469,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             }
         }
     }
+    if (bind_node >= 0) note += "; NUMA node " + std::to_string(bind_node);
 }
 
 PinnedArena::~PinnedArena() {
