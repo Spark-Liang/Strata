@@ -419,6 +419,8 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     : host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
+    if (const char* e = std::getenv("STRATA_POOL_TASKS_PER_THREAD"))   // phase-granularity knob: 3 = upstream
+        tasks_per_thread_ = (std::min)(64, (std::max)(1, std::atoi(e)));
     if (n_workers > 0) {
         n_ = n_workers;
     } else if (topo_.is_hybrid && affinity_ != PoolAffinity::All) {
@@ -805,7 +807,7 @@ void ExpertPool::build_node_tasks(int mode, ExpertJobMulti* jobs, int n, int per
         node_rows_[nd] = rows;
         const int threads = node_workers(nd);
         if (rows <= 0 || threads <= 0) continue;
-        const int nt = (std::max)(1, 3 * threads);
+        const int nt = (std::max)(1, tasks_per_thread_ * threads);
         for (int t = 0; t < nt; ++t) {
             const int64_t r0 = rows * t / nt, r1 = rows * (t + 1) / nt;
             if (r1 > r0) tasks_[nd].push_back({r0, r1});
@@ -901,7 +903,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         const int threads = n_ + (host_works_ ? 1 : 0);
-        mtasks_ = 3 * threads;
+    mtasks_ = tasks_per_thread_ * threads;
         const bool nodes_batch = n_nodes_ > 1 && batch_uses_nodes(mjobs_, nb, host_node_);
         const auto a = std::chrono::steady_clock::now();
         if (nodes_batch) {

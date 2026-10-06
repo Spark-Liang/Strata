@@ -281,6 +281,9 @@ private:
     std::mutex sleep_mu_;
     std::condition_variable sleep_cv_;
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
+    // Equal row ranges the multi phase is cut into, per worker: more tasks shorten the phase tail at the cost of
+    // more claims.  STRATA_POOL_TASKS_PER_THREAD overrides it (see the constructor).
+    int tasks_per_thread_ = 3;
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
