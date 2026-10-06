@@ -27,7 +27,54 @@ namespace {
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
 }
+
+#if defined(__linux__)
+// L1 NUMA: the node of every CPU, read once from /sys/devices/system/node/node<N>/cpulist ("0-17,36-53", the
+// format the kernel documents).  Empty on any failure, which the constructor turns into the legacy single-node
+// path.  Deliberately not `physical_package_id`: it happens to equal the node on one-node-per-socket systems
+// and does not on NPS2/NPS4 parts.
+std::vector<int> sysfs_cpu_nodes() {
+    std::vector<int> map;
+    for (int node = 0; node < 1024; ++node) {
+        char path[96];
+        std::snprintf(path, sizeof path, "/sys/devices/system/node/node%d/cpulist", node);
+        std::FILE* f = std::fopen(path, "r");
+        if (f == nullptr) break;   // node ids are contiguous from 0
+        char buf[8192];
+        const size_t got = std::fread(buf, 1, sizeof buf - 1, f);
+        std::fclose(f);
+        buf[got] = '\0';
+        char* p = buf;
+        while (*p != '\0') {
+            char* end = nullptr;
+            const long lo = std::strtol(p, &end, 10);
+            if (end == p) break;
+            long hi = lo;
+            p = end;
+            if (*p == '-') {
+                hi = std::strtol(p + 1, &end, 10);
+                p = end;
+            }
+            if (lo < 0 || hi > (1 << 20) || hi < lo) break;
+            if ((long) map.size() <= hi) map.resize((size_t) hi + 1, -1);
+            for (long c = lo; c <= hi; ++c) map[(size_t) c] = node;
+            if (*p == ',') ++p;
+        }
+    }
+    return map;
+}
+#endif
 }  // namespace
+
+/// L1 NUMA: whether a batch has any job outside `host_node`.  A batch on the host node only is the
+/// unpartitioned source's answer (every `ExpertJobMulti.node` defaulted to 0) or a lopsided route; both take
+/// the legacy single-head path, where every worker claims - so enabling the pool on a two-node machine before
+/// the arena is partitioned can only be neutral, never a regression that idles one node.
+static bool batch_uses_nodes(const ExpertJobMulti* jobs, int n, int host_node) {
+    for (int e = 0; e < n; ++e)
+        if (jobs[e].node != host_node) return true;
+    return false;
+}
 
 CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     CpuTopology topo;
@@ -348,10 +395,10 @@ int64_t now_ms() {
 }  // namespace
 
 void ExpertPool::diag(std::FILE* f) const {
-    const uint64_t h = head_.load();
+    const uint64_t h = head_[0].load();
     std::fprintf(f, "  expert pool: epoch %u, batch epoch %u: %u of %u jobs claimed, %u done; %u of %d workers parked, "
-                    "%u sleeping; mode %d\n", epoch_.load(), (uint32_t) (h >> 32), (uint32_t) h & 0xffffu,
-                 (uint32_t) (h >> 16) & 0xffffu, done_.load(), parked_.load(), n_, sleepers_.load(), mode_);
+                    "%u sleeping; mode %d, nodes %d\n", epoch_.load(), (uint32_t) (h >> 32), (uint32_t) h & 0xffffu,
+                 (uint32_t) (h >> 16) & 0xffffu, done_.load(), parked_.load(), n_, sleepers_.load(), mode_, n_nodes_);
     std::fprintf(f, "  expert pool threads:");
     for (int i = 0; i < n_; ++i) {
         const int32_t s = wstate_[(size_t) i].load();
@@ -380,6 +427,54 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
         n_ = (int) topo_.worker_cores.size();
     }
     if (n_ < 1) n_ = 1;
+    // ---- L1 NUMA: which node each worker sits on.  STRATA_POOL_LOGICAL_NODES=2 is a test knob that splits the
+    // workers round-robin over two logical nodes on any machine, so the two-head claim protocol is what it
+    // stresses; otherwise the node comes from sysfs and any failure keeps the legacy single-head path.
+    if (const char* v = std::getenv("STRATA_POOL_LOGICAL_NODES")) {
+        const int k = std::atoi(v);
+        if (k >= 2 && k <= kMaxNodes && k <= n_) {
+            n_nodes_ = k;
+            worker_node_.resize((size_t) n_, 0);
+            for (int i = 0; i < n_; ++i) worker_node_[(size_t) i] = i % k;
+        }
+    }
+#if defined(__linux__)
+    if (n_nodes_ == 1) {
+        const std::vector<int> cpu_node = sysfs_cpu_nodes();
+        if (!cpu_node.empty()) {
+            std::vector<int> wn((size_t) n_, 0);
+            int max_node = 0;
+            bool ok = true;
+            for (int i = 0; i < n_; ++i) {
+                const int c = i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1;
+                if (c < 0 || c >= (int) cpu_node.size() || cpu_node[(size_t) c] < 0) { ok = false; break; }
+                wn[(size_t) i] = cpu_node[(size_t) c];
+                max_node = (std::max)(max_node, wn[(size_t) i]);
+            }
+            // More than one node is used only when every node with worker tasks has a claiming thread: a job on
+            // a node nobody claims would never complete.  A node whose only claimant would be the host counts
+            // only when the host works.
+            if (ok && max_node + 1 >= 2 && max_node + 1 <= kMaxNodes) {
+                int host_cpu_node = -1;
+                if (topo_.host_core >= 0 && topo_.host_core < (int) cpu_node.size())
+                    host_cpu_node = cpu_node[(size_t) topo_.host_core];
+                bool each = true;
+                for (int nd = 0; nd < max_node + 1; ++nd) {
+                    bool has = false;
+                    for (int i = 0; i < n_; ++i) has = has || wn[(size_t) i] == nd;
+                    if (host_works_ && host_cpu_node == nd) has = true;
+                    each = each && has;
+                }
+                if (each) {
+                    n_nodes_ = max_node + 1;
+                    worker_node_ = std::move(wn);
+                }
+                if (host_cpu_node >= 0) host_node_ = host_cpu_node;
+            }
+        }
+    }
+#endif
+    worker_node_.resize((size_t) n_, 0);   // the legacy path: every worker on node 0, `n_nodes_` stays 1
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
@@ -405,6 +500,14 @@ ExpertPool::~ExpertPool() {
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
     publish();
     for (auto& t : threads_) t.join();
+}
+
+int ExpertPool::node_workers(int node) const {
+    if (node < 0 || node >= kMaxNodes) return 0;
+    int c = 0;
+    for (int w : worker_node_) c += (w == node);
+    if (host_works_ && host_node_ == node) ++c;
+    return c;
 }
 
 void ExpertPool::publish() {
@@ -464,19 +567,38 @@ void ExpertPool::worker(int id) {
         // Every job is the same size (all experts are 1,382,400 bytes), so there is nothing to schedule.  Only
         // this epoch's jobs: if the host has already moved on, the claims fail and the worker parks again.
         wstate_[(size_t) id].store(kBetween, std::memory_order_relaxed);
-        drain(id, scratch_[(size_t) id], seen);
+        // L1 NUMA: a per-node batch claims only this worker's node's tasks; a legacy batch keeps the single-head
+        // order, which is what the fields `jobs_`/`mjobs_` still describe.
+        const int drain_node = per_node_batch_ ? worker_node_[(size_t) id] : 0;
+        drain(id, scratch_[(size_t) id], seen, drain_node);
         wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
         parked_.fetch_add(1, std::memory_order_acq_rel);   // back at the park
     }
 }
 
-int ExpertPool::claim(uint32_t epoch) {
-    uint64_t h = head_.load(std::memory_order_acquire);
+int ExpertPool::claim(uint32_t epoch, int node, int64_t& row0, int64_t& row1) {
+    if (node < 0 || node >= kMaxNodes) node = 0;
+    uint64_t h = head_[node].load(std::memory_order_acquire);
+    for (;;) {
+        if ((uint32_t) (h >> 32) != epoch) return -1;               // not the batch this thread woke for
+        const uint32_t n = (uint32_t) (h >> 16) & 0xffffu, i = (uint32_t) h & 0xffffu;
+        if (i >= n) return -1;                                       // this node's table is exhausted
+        if (head_[node].compare_exchange_weak(h, h + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            const PhaseTask& t = tasks_[node][i];
+            row0 = t.row0;
+            row1 = t.row1;
+            return (int) i;
+        }
+    }
+}
+
+int ExpertPool::claim_index(uint32_t epoch) {
+    uint64_t h = head_[0].load(std::memory_order_acquire);
     for (;;) {
         if ((uint32_t) (h >> 32) != epoch) return -1;               // not the batch this thread woke for
         const uint32_t n = (uint32_t) (h >> 16) & 0xffffu, i = (uint32_t) h & 0xffffu;
         if (i >= n) return -1;                                       // exhausted
-        if (head_.compare_exchange_weak(h, h + 1, std::memory_order_acq_rel, std::memory_order_acquire))
+        if (head_[0].compare_exchange_weak(h, h + 1, std::memory_order_acq_rel, std::memory_order_acquire))
             return (int) i;
     }
 }
@@ -490,7 +612,20 @@ uint32_t ExpertPool::begin_batch(int n) {
     // nothing adds to `done` until this batch's first claim - which the release below orders after the reset.
     done_.store(0, std::memory_order_relaxed);
     const uint32_t e = epoch_.load(std::memory_order_relaxed) + 1;   // only the host bumps the epoch
-    head_.store(pack_head(e, (uint32_t) n, 0), std::memory_order_release);
+    if (per_node_batch_) {
+        // L1 NUMA: every node's table is described, then one publish wakes all the workers.  A node with no
+        // tasks gets a head with n = 0, so its workers claim nothing and re-park - the empty-node case.
+        uint32_t total = 0;
+        for (int nd = 0; nd < n_nodes_; ++nd) {
+            const uint32_t nt = (uint32_t) tasks_[nd].size();
+            total += nt;
+            head_[nd].store(pack_head(e, nt, 0), std::memory_order_release);
+        }
+        batch_tasks_ = total;
+    } else {
+        head_[0].store(pack_head(e, (uint32_t) n, 0), std::memory_order_release);
+        batch_tasks_ = (uint32_t) n;
+    }
     publish();
     return e;
 }
@@ -539,10 +674,25 @@ void ExpertPool::wait_done(int n) {
     }
 }
 
-void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
+void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch, int node) {
     (void) id;
     for (;;) {
-        const int ci = claim(epoch);
+        // L1 NUMA: a per-node batch claims from this node's table, which hands back a row range in that node's
+        // row space.  A legacy batch keeps the single-head index claim, from which the row range is derived
+        // exactly as it was before.
+        const bool per_node = per_node_batch_;
+        int ci = -1;
+        int64_t g0 = 0, g1 = 0;
+        if (per_node) {
+            ci = claim(epoch, node, g0, g1);
+        } else {
+            ci = claim_index(epoch);
+            if (ci >= 0 && mode_ >= 3) {
+                const uint32_t t = (uint32_t) ci;
+                g0 = mrows_ * (int64_t) t / mtasks_;
+                g1 = mrows_ * (int64_t) (t + 1) / mtasks_;
+            }
+        }
         if (ci < 0) break;
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
@@ -561,9 +711,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
             const int per = mode_ == 5 ? FF : H;
-            const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
             for (int64_t r = g0; r < g1;) {
-                const int e = (int) (r / per), r0 = (int) (r % per);
+                const int e = per_node ? node_experts_[node][(size_t) (r / per)] : (int) (r / per);
+                const int r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
                 if (mode_ == 5 && q2_native_kernels(nfmt_->gu_type)) {
@@ -598,9 +748,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         } else {
             // plan v0.3 P6: an equal range of the phase's rows across ALL its experts (a range may span two)
             const int per = mode_ == 3 ? FF : H;
-            const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
             for (int64_t r = g0; r < g1;) {
-                const int e = (int) (r / per), r0 = (int) (r % per);
+                const int e = per_node ? node_experts_[node][(size_t) (r / per)] : (int) (r / per);
+                const int r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
                 if (mode_ == 3) {
@@ -622,10 +772,55 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
 void ExpertPool::run_phase(int mode, int n_tasks) {
     wait_parked("before a phase");
     mode_ = mode;
+    per_node_batch_ = false;   // a legacy phase: one head, every worker claims
     njobs_ = n_tasks;
     const uint32_t e = begin_batch(n_tasks);
-    if (host_works_) drain(-1, host_scratch_, e);
+    if (host_works_) drain(-1, host_scratch_, e, 0);
     wait_done(n_tasks);
+    wait_parked("after a phase");
+    hstate_.store(kIdle, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+}
+
+void ExpertPool::build_node_tasks(int mode, ExpertJobMulti* jobs, int n, int per) {
+    (void) mode;
+    batch_tasks_ = 0;
+    per_node_batch_ = n_nodes_ > 1;
+    for (int nd = 0; nd < kMaxNodes; ++nd) {
+        tasks_[nd].clear();
+        node_experts_[nd].clear();
+        node_rows_[nd] = 0;
+    }
+    if (n_nodes_ <= 1) return;
+    // A job whose node has no claiming thread is drained by the host's node instead: stranding it on a node
+    // nobody claims would leave `done` short of the batch and stall the pool (the guard the constructor already
+    // applies to the worker layout).
+    for (int e = 0; e < n; ++e) {
+        int nd = jobs[e].node;
+        if (nd < 0 || nd >= n_nodes_ || node_workers(nd) <= 0) nd = host_node_;
+        node_experts_[nd].push_back(e);
+    }
+    for (int nd = 0; nd < n_nodes_; ++nd) {
+        const int64_t rows = (int64_t) node_experts_[nd].size() * per;
+        node_rows_[nd] = rows;
+        const int threads = node_workers(nd);
+        if (rows <= 0 || threads <= 0) continue;
+        const int nt = (std::max)(1, 3 * threads);
+        for (int t = 0; t < nt; ++t) {
+            const int64_t r0 = rows * t / nt, r1 = rows * (t + 1) / nt;
+            if (r1 > r0) tasks_[nd].push_back({r0, r1});
+        }
+        batch_tasks_ += (uint32_t) tasks_[nd].size();
+    }
+}
+
+void ExpertPool::run_phase_nodes(int mode) {
+    wait_parked("before a phase");
+    mode_ = mode;
+    njobs_ = (int) batch_tasks_;
+    const uint32_t e = begin_batch(0);   // mode_ >= 3 with n_nodes_ > 1: publishes every node's head
+    if (host_works_) drain(-1, host_scratch_, e, host_node_);
+    wait_done((int) batch_tasks_);
     wait_parked("after a phase");
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
@@ -668,15 +863,26 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     mjobs_ = jobs;
     const int threads = n_ + (host_works_ ? 1 : 0);
     mtasks_ = 3 * threads;
-    mrows_ = (int64_t) n * FF;
-    run_phase(3, mtasks_);
+    const bool nodes_batch = n_nodes_ > 1 && batch_uses_nodes(jobs, n, host_node_);
+    if (nodes_batch) {
+        build_node_tasks(3, jobs, n, FF);
+        run_phase_nodes(3);
+    } else {
+        mrows_ = (int64_t) n * FF;
+        run_phase(3, mtasks_);
+    }
     const auto t1 = std::chrono::steady_clock::now();
     for (int e = 0; e < n; ++e)
         for (int t = 0; t < jobs[e].nt; ++t)
             act_quant_q8_1(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
     const auto t2 = std::chrono::steady_clock::now();
-    mrows_ = (int64_t) n * H;
-    run_phase(4, mtasks_);
+    if (nodes_batch) {
+        build_node_tasks(4, jobs, n, H);
+        run_phase_nodes(4);
+    } else {
+        mrows_ = (int64_t) n * H;
+        run_phase(4, mtasks_);
+    }
     const auto t3 = std::chrono::steady_clock::now();
     ms_multi_gu += std::chrono::duration<double, std::milli>(t1 - t0).count();
     ms_multi_q += std::chrono::duration<double, std::milli>(t2 - t1).count();
@@ -696,17 +902,28 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         nfmt_ = &f;
         const int threads = n_ + (host_works_ ? 1 : 0);
         mtasks_ = 3 * threads;
-        mrows_ = (int64_t) nb * FF;
+        const bool nodes_batch = n_nodes_ > 1 && batch_uses_nodes(mjobs_, nb, host_node_);
         const auto a = std::chrono::steady_clock::now();
-        run_phase(5, mtasks_);
+        if (nodes_batch) {
+            build_node_tasks(5, mjobs_, nb, FF);
+            run_phase_nodes(5);
+        } else {
+            mrows_ = (int64_t) nb * FF;
+            run_phase(5, mtasks_);
+        }
         const auto b = std::chrono::steady_clock::now();
         for (int e = 0; e < nb; ++e)
             for (int t = 0; t < mjobs_[e].nt; ++t)
                 if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
-        mrows_ = (int64_t) nb * H;
-        run_phase(6, mtasks_);
+        if (nodes_batch) {
+            build_node_tasks(6, mjobs_, nb, H);
+            run_phase_nodes(6);
+        } else {
+            mrows_ = (int64_t) nb * H;
+            run_phase(6, mtasks_);
+        }
         const auto d = std::chrono::steady_clock::now();
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
         ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
@@ -752,7 +969,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     // device after `run()` returns, so the write must be published, not merely performed.
     if (host_works_) {
         for (;;) {
-            const int ci = claim(e);
+            const int ci = claim_index(e);
             if (ci < 0) break;
             hstate_.store(ci, std::memory_order_relaxed);
             hstate_ms_.store(now_ms(), std::memory_order_relaxed);

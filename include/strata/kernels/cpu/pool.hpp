@@ -56,6 +56,10 @@ struct ExpertJob {
 /// is bitwise the single-token job's.
 struct ExpertJobMulti {
     const uint8_t* blob = nullptr;
+    /// L1 NUMA: the node the blob's bytes live on.  The pool splits every phase's row space per node and each
+    /// worker claims only its own node's tasks (`--pool-affinity` + the placed arena).  Default 0 keeps a
+    /// single-node machine on the legacy path byte for byte.
+    int node = 0;
     int nt = 0;
     const ActQ* act[MAXT] = {};
     float* out[MAXT] = {};
@@ -147,6 +151,14 @@ public:
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
 
+    /// L1 NUMA: how many NUMA nodes the workers were split over (1 = the legacy single-head behaviour), which
+    /// node each worker was placed on, and how many workers (host included) claim from a node.
+    int nodes() const { return n_nodes_; }
+    int worker_node(int i) const {
+        return i >= 0 && i < (int) worker_node_.size() ? worker_node_[(size_t) i] : 0;
+    }
+    int node_workers(int node) const;
+
     bool is_hybrid() const { return topo_.is_hybrid; }
     int p_cores() const { return topo_.p_cores; }
     int p_threads() const { return topo_.p_threads; }
@@ -205,10 +217,17 @@ public:
 
 private:
     void worker(int id);
-    void drain(int id, ExpertScratch& scratch, uint32_t epoch);
+    void drain(int id, ExpertScratch& scratch, uint32_t epoch, int node);
     void run_phase(int mode, int n_tasks);
-    /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
-    int claim(uint32_t epoch);
+    /// L1 NUMA: build the per-node row spaces for the multi-token modes (3..6) from the jobs' `node` fields.
+    /// `per` is FF for the gate/up modes and H for the down modes, exactly as the legacy `mrows_` split was.
+    void build_node_tasks(int mode, ExpertJobMulti* jobs, int n, int per);
+    /// Publish and run a phase whose per-node task tables `build_node_tasks` has just filled.
+    void run_phase_nodes(int mode);
+    /// Claim the next task of batch `epoch` for `node` (rows in that node's row space), or -1.
+    int claim(uint32_t epoch, int node, int64_t& row0, int64_t& row1);
+    /// The legacy single-head claim (modes 0..2, and one-node machines): the next job/part index, or -1.
+    int claim_index(uint32_t epoch);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
     uint32_t begin_batch(int n);
     /// The host's waits, bounded by `kStall`.
@@ -247,7 +266,11 @@ private:
     std::unique_ptr<std::atomic<int32_t>[]> wstate_;
     std::atomic<int32_t> hstate_{kIdle};
     std::atomic<int64_t> hstate_ms_{0};
-    alignas(64) std::atomic<uint64_t> head_{0};   // epoch << 32 | njobs << 16 | next index (issue #29)
+    // ---- L1 NUMA: one claim head per node.  With `n_nodes_ == 1` `head_[0]` carries the legacy single-head
+    // batch; with more nodes a multi-token phase publishes every node's head from the same epoch.  Each head is
+    // its own cache line, as the single head was (review finding C3), so the two drain groups never share one.
+    static constexpr int kMaxNodes = 2;
+    alignas(64) std::atomic<uint64_t> head_[kMaxNodes];
     alignas(64) std::atomic<uint32_t> done_{0};
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
@@ -279,6 +302,19 @@ private:
     };
     const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;
+    // ---- L1 NUMA state: the node of each worker, the host's node, and the per-node task tables of the phase.
+    int n_nodes_ = 1;
+    int host_node_ = 0;
+    std::vector<int> worker_node_;
+    struct PhaseTask { int64_t row0 = 0, row1 = 0; };
+    std::vector<PhaseTask> tasks_[kMaxNodes];
+    std::vector<int> node_experts_[kMaxNodes];   ///< global job index of each expert in that node's row space
+    int64_t node_rows_[kMaxNodes] = {0, 0};      ///< rows in that node's row space (per=FF for gate/up, H for down)
+    uint32_t batch_tasks_ = 0;                   ///< tasks across all nodes in the published batch
+    /// Whether the published batch uses `tasks_[nd]` (set by `build_node_tasks`, cleared by `run_phase`).
+    /// The workers read it after the epoch acquire, like `mode_`; it is what keeps a legacy batch and a
+    /// per-node batch from sharing one code path by accident.
+    bool per_node_batch_ = false;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
 };
