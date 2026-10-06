@@ -22,6 +22,7 @@
 #pragma once
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_placement.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
@@ -110,16 +111,20 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
 
 
 
-/// Where one routed expert's bytes come from.
-///
-/// Phase 2 has NO cache (`phase-2-correct-engine.md`: hit rate `h = 0`), so the only implementation is a
-/// file-backed reader.  The interface exists anyway because Phase 3 replaces exactly this object with the VRAM
-/// cache, and because a test can supply an in-memory source without a 34 GB artifact.
-class ExpertSource {
-public:
-    virtual ~ExpertSource() = default;
+    /// Where one routed expert's bytes come from.
+    ///
+    /// Phase 2 has NO cache (`phase-2-correct-engine.md`: hit rate `h = 0`), so the only implementation is a
+    /// file-backed reader.  The interface exists anyway because Phase 3 replaces exactly this object with the
+    /// VRAM cache, and because a test can supply an in-memory source without a 34 GB artifact.
+    class ExpertSource {
+    public:
+        virtual ~ExpertSource() = default;
 
-    /// The expert-layout blob for `(layer, expert)`, or nullptr if it cannot be produced.
+        /// L1 NUMA: the node `blob(layer, expert)` lives on (its bytes and its CUDA registration).  Sources
+        /// without a placed arena answer 0, which keeps a one-node machine on the pool's legacy path.
+        virtual int node_of(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return 0; }
+
+        /// The expert-layout blob for `(layer, expert)`, or nullptr if it cannot be produced.
     ///
     /// The pointer only has to stay valid until the next `blob()` call: with `h = 0` every expert is computed
     /// immediately and nothing is retained.  A CACHING source must return pointers into the cache, not into a
@@ -661,12 +666,25 @@ public:
     /// rate, because those are the two numbers that say whether the arena is the one that was asked for.
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads, std::string& err,
               uint64_t max_pinned_bytes = 0, const std::string& shared_arena_file = {});
+    /// L1 NUMA: request a placement over `n_nodes` arenas before `open`.  `hot` (may be null) is the expert
+    /// profile rank, hottest first; its entries are biased onto node 0 (where the GPU is).  With 1 (the
+    /// default) the source behaves exactly as before, one arena at the allocator's default policy.
+    void set_partition(int n_nodes, const std::vector<std::pair<int32_t, int32_t>>* hot = nullptr) {
+        part_nodes_ = n_nodes;
+        part_hot_ = hot;
+    }
+    /// The node of `(layer, expert)`: 0 when unpartitioned, the placement's answer otherwise.
+    int node_of(int64_t layer, int64_t expert) const override { return place_.node_of(layer, expert); }
+    /// Whether the arena is split over more than one node (for the startup print).
+    bool partitioned() const { return !place_.empty(); }
+    /// Bytes the placement gave each node (0 when unpartitioned; `node_bytes_[0]` is the whole arena then).
+    uint64_t node_bytes(int nd) const { return nd >= 0 && nd < 2 ? node_bytes_[nd] : 0; }
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's GGUF: `native` is the
     /// --native shard, and native_experts.txt names the other shards beside it (per layer, or per role in v4).
     void set_gguf(const std::string& native) { gguf_ = native; }
     void close();
 
-    bool mapped() const { return base_ != nullptr; }
+    bool mapped() const { return base_[0] != nullptr || base_[1] != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     int64_t reads() const { return reads_; }
@@ -689,12 +707,23 @@ public:
     double load_copy_seconds() const { return load_copy_s_; }
 
 private:
-    void* arena_ = nullptr;          ///< the PinnedArena, owned
+    /// L1 NUMA: where `(layer, expert)`'s blob lives - the node and its offset inside that node's arena.  One
+    /// helper for `blob()`/`pinned()`/`device_alias()`, so the placement is consulted in exactly one place.
+    const uint8_t* slot_of(int64_t layer, int64_t expert, uint64_t& local_off, int& node) const;
+
+    void* arena_[2] = {nullptr, nullptr};    ///< the PinnedArena of each node (or of the single allocation)
     void* map_ = nullptr;            ///< STRATA_ARENA_MMAP: the arena file, mapped read-only (not the PinnedArena)
     uint64_t map_bytes_ = 0;
-    std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)
-    uint64_t slice_bytes_ = 0;
-    const uint8_t* base_ = nullptr;
+    std::vector<const uint8_t*> dev_slice_[2];   ///< device alias of each registered slice (or of the whole range)
+    uint64_t slice_bytes_[2] = {0, 0};
+    const uint8_t* base_[2] = {nullptr, nullptr};
+    uint64_t pinned_bytes_[2] = {0, 0};
+    uint64_t node_bytes_[2] = {0, 0};
+    /// Placement state; `place_.empty()` means one arena and the pre-L1 behaviour byte for byte.
+    int part_nodes_ = 1;
+    const std::vector<std::pair<int32_t, int32_t>>* part_hot_ = nullptr;
+    ExpertPlacement place_;
+    std::vector<uint64_t> local_off_;   ///< [layer*n_expert+expert] -> offset inside its node's arena
     int64_t blobs_ = 0;
     int64_t n_expert_ = 0;
     int64_t reads_ = 0;
@@ -704,7 +733,6 @@ private:
     double load_seconds_ = 0.0;
     double load_read_s_ = 0.0;
     double load_copy_s_ = 0.0;
-    uint64_t pinned_bytes_ = 0;
     std::string gguf_;
 };
 
@@ -713,8 +741,12 @@ private:
 /// layout's type and dimensions, and inside the file.  `native` is the --native shard (see set_gguf).
 bool check_experts_gguf(const std::string& native, const strata::kernels::cpu::ExpertLayout& lay, std::string& err);
 /// Fills `dst` (lay.total bytes, the experts.bin layout) from the GGUF files, one role at a time.
-/// `unbuffered`: each chunk read past the file cache (Windows).
+/// `unbuffered`: each chunk read past the file cache (Windows).  `dst_for` (optional) resolves where one role's
+/// bytes go - (ctx, layer, expert, role_offset) -> destination - which is how the L1 partition loads each
+/// expert into its own node's arena.  nullptr keeps `dst + blob_offset(layer, expert) + role_offset`.
+using ExpertDstFn = uint8_t* (*)(void* ctx, int64_t layer, int64_t expert, uint64_t role_offset);
 LoadStats load_experts_gguf(const std::string& native, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
-                            int threads, bool unbuffered = false);
+                            int threads, bool unbuffered = false, ExpertDstFn dst_for = nullptr,
+                            void* dst_ctx = nullptr);
 
 }  // namespace strata::core

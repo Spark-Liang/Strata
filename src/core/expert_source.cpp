@@ -2198,6 +2198,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 jo = (int16_t) njobs++;
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
+                // L1 NUMA: the pool splits each phase's row space by this node and each worker claims only its
+                // own node's tasks.  A one-node machine answers 0 for every expert and takes the legacy path.
+                nj.node = d.src->node_of(d.layers, e);
                 nj.nt = 0;
             }
             ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
@@ -2532,10 +2535,15 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
 // `unbuffered` (Windows, experts_unbuffered): each chunk's 4 KiB-aligned window is read with FILE_FLAG_NO_BUFFERING into
 // an aligned buffer and scattered into the blobs - no copy through the file cache when the drive is read anyway.
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
-                            int threads, bool unbuffered) {
+                            int threads, bool unbuffered, ExpertDstFn dst_for, void* dst_ctx) {
     LoadStats st;
     st.layers = (uint64_t) lay.n_layers;
     const auto t0 = std::chrono::steady_clock::now();
+    // L1 NUMA: one resolver for both platform paths.  nullptr keeps the canonical destination
+    // `dst + blob_offset(layer, expert) + role_offset`; the partition resolves to the expert's node arena.
+    auto blob_dst = [&](int64_t l, int64_t e, uint64_t role_off) -> uint8_t* {
+        return dst_for != nullptr ? dst_for(dst_ctx, l, e, role_off) : dst + lay.blob_offset(l, e) + role_off;
+    };
     std::atomic<int64_t> next{0};
     std::atomic<bool> bad{false};
 #if defined(_WIN32)
@@ -2602,7 +2610,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
                         const uint8_t* q = buf + (src + done - a0);
                         for (uint64_t k = 0; k < n / per[r]; ++k) {
                             const uint64_t e = done / per[r] + k;
-                            std::memcpy(dst + lay.blob_offset(l, (int64_t) e) + at[r], q + k * per[r], (size_t) per[r]);
+                            std::memcpy(blob_dst(l, (int64_t) e, at[r]), q + k * per[r], (size_t) per[r]);
                         }
                     }
                 }
@@ -2665,7 +2673,7 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
                     if (std::fread(buf.data(), 1, (size_t) n, f) != (size_t) n) { bad = true; return; }
                     for (uint64_t k = 0; k < n / per[r]; ++k) {
                         const uint64_t e = done / per[r] + k;
-                        std::memcpy(dst + lay.blob_offset(l, (int64_t) e) + at[r], buf.data() + k * per[r], (size_t) per[r]);
+                        std::memcpy(blob_dst(l, (int64_t) e, at[r]), buf.data() + k * per[r], (size_t) per[r]);
                     }
                 }
             }
@@ -2685,6 +2693,54 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
     st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return st;
 }
+
+namespace {
+// L1 NUMA: one expert's bytes from the expert file into its own node's arena.  `ranges` is the whole pack in
+// file order; each thread opens its own FILE* and takes ranges off an atomic counter.  A read lands straight
+// in the slot (no staging copy), so the only memory traffic is file -> arena.
+struct ScatterRange {
+    uint64_t off = 0, len = 0;
+    uint8_t* dst = nullptr;
+};
+
+LoadStats load_experts_scatter(const std::string& path, const std::vector<ScatterRange>& ranges, int threads) {
+    LoadStats st;
+    if (threads < 1) threads = 1;
+    std::atomic<size_t> next{0};
+    std::atomic<bool> bad{false};
+    const auto t0 = std::chrono::steady_clock::now();
+    auto worker = [&]() {
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (f == nullptr) { bad = true; return; }
+        struct Closer {
+            std::FILE* f;
+            ~Closer() { if (f != nullptr) std::fclose(f); }
+        } closer{f};
+        for (;;) {
+            const size_t i = next.fetch_add(1);
+            if (i >= ranges.size() || bad.load(std::memory_order_relaxed)) break;
+            const ScatterRange& r = ranges[i];
+            if (STRATA_FSEEK64(f, (off_t) r.off) != 0) { bad = true; return; }
+            if (std::fread(r.dst, 1, (size_t) r.len, f) != (size_t) r.len) { bad = true; return; }
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
+    worker();
+    for (auto& t : pool) t.join();
+    if (bad) {
+        st.seconds = -1.0;
+        st.ok = false;
+        st.error = "short read or unreadable expert file (NUMA scatter loader)";
+        return st;
+    }
+    uint64_t bytes = 0;
+    for (const ScatterRange& r : ranges) bytes += r.len;
+    st.bytes = bytes;
+    st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return st;
+}
+}  // namespace
 
 ArenaExpertSource::~ArenaExpertSource() { close(); }
 
@@ -2737,6 +2793,12 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     static const bool arena_mmap = false;   // POSIX mmap/madvise: Linux only for now
 #else
     static const bool arena_mmap = [] { const char* v = std::getenv("STRATA_ARENA_MMAP"); return v && v[0] == '1'; }();
+    if (arena_mmap && part_nodes_ > 1) {
+        // The mapped-arena mode is the small-RAM path; a partition needs two resident arenas.  Say so and run
+        // single-node rather than half-applying both.
+        std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP is set; ignoring the L1 NUMA partition\n");
+        part_nodes_ = 1;
+    }
     if (arena_mmap) {
         const uint64_t file_bytes = want + (uint64_t) blob;
         uint64_t have = 0;
@@ -2751,10 +2813,10 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             if (v == MAP_FAILED) { err = "ArenaExpertSource: mmap of " + path + " failed"; return false; }
             map_ = v;
             map_bytes_ = file_bytes;
-            base_ = (const uint8_t*) v;
-            pinned_bytes_ = 0;
-            dev_slice_.clear();
-            slice_bytes_ = 0;
+            base_[0] = (const uint8_t*) v;
+            pinned_bytes_[0] = 0;
+            dev_slice_[0].clear();
+            slice_bytes_[0] = 0;
             blobs_ = n_layers * n_expert;
             n_expert_ = n_expert;
             reads_ = 0;
@@ -2803,6 +2865,34 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 
     // one layer per registration slice, so no expert straddles two registrations.  The arena is one blob
     // longer than the file: a copy of a whole VRAM slot (the largest blob) may then start at any expert.
+    // L1 NUMA: build the placement and the per-node local offsets before any allocation.  The offsets walk the
+    // layers in order and append each expert to its node's arena, so one arena's experts are contiguous and the
+    // whole arena can use 2 MB pages and one CUDA registration.
+    if (part_nodes_ > 1) {
+        std::vector<uint64_t> blob_bytes((size_t) n_layers);
+        for (int64_t l = 0; l < n_layers; ++l) blob_bytes[(size_t) l] = lay.blob_bytes(l);
+        std::string perr;
+        if (!strata::core::build_expert_placement(n_layers, n_expert, blob_bytes, part_hot_, part_nodes_, place_, perr)) {
+            err = "ArenaExpertSource: " + perr;
+            return false;
+        }
+        if (!shared_arena_file.empty()) {
+            err = "ArenaExpertSource: a shared arena file cannot back a partitioned (L1 NUMA) arena";
+            return false;
+        }
+        node_bytes_[0] = place_.bytes_of(0, blob_bytes);
+        node_bytes_[1] = place_.bytes_of(1, blob_bytes);
+        local_off_.assign((size_t) (n_layers * n_expert), 0);
+        uint64_t fill[2] = {0, 0};
+        for (int64_t l = 0; l < n_layers; ++l)
+            for (int64_t e = 0; e < n_expert; ++e) {
+                const int nd = place_.node_of(l, e);
+                const size_t idx = (size_t) (l * n_expert + e);
+                local_off_[idx] = fill[nd];
+                fill[nd] += lay.blob_bytes(l);
+            }
+    }
+
     std::vector<uint64_t> bounds, loff, lbytes;
     for (int64_t l = 0; l < n_layers; ++l) {
         bounds.push_back(lay.layer_offset(l));
@@ -2810,16 +2900,41 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
-    PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes,
-                                     shared_arena_file, pack_hash);
-    if (!a->valid()) {
-        const std::string why = a->note;
-        delete a;
-        err = "ArenaExpertSource: the arena could not be reserved (" +
-              std::to_string(want + (uint64_t) blob) + " B)" +
-              (why.empty() ? std::string{} : ": " + why);
-        return false;
+    PinnedArena* a = nullptr;
+    if (place_.empty()) {
+        a = new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes, shared_arena_file, pack_hash);
+        if (!a->valid()) {
+            const std::string why = a->note;
+            delete a;
+            err = "ArenaExpertSource: the arena could not be reserved (" +
+                  std::to_string(want + (uint64_t) blob) + " B)" +
+                  (why.empty() ? std::string{} : ": " + why);
+            return false;
+        }
+        arena_[0] = a;
+    } else {
+        // L1 NUMA: one arena per node, each bound to its node before any page is touched.  One blob of slack
+        // per arena, so a whole-slot GPU copy may start at any of that node's experts.
+        PinnedArena* a0 = new PinnedArena(node_bytes_[0] + (uint64_t) blob, /*slice=*/0, /*bind_node=*/0);
+        PinnedArena* a1 = new PinnedArena(node_bytes_[1] + (uint64_t) blob, /*slice=*/0, /*bind_node=*/1);
+        if (!a0->valid() || !a1->valid()) {
+            err = "ArenaExpertSource: the partitioned arena could not be reserved (node0 " +
+                  std::to_string(node_bytes_[0] + (uint64_t) blob) + " B: " + a0->note + "; node1 " +
+                  std::to_string(node_bytes_[1] + (uint64_t) blob) + " B: " + a1->note + ")";
+            delete a0;
+            delete a1;
+            return false;
+        }
+        arena_[0] = a0;
+        arena_[1] = a1;
+        a = a0;
     }
+    auto drop_arenas = [&]() {
+        for (int nd = 0; nd < 2; ++nd) {
+            delete (PinnedArena*) arena_[nd];
+            arena_[nd] = nullptr;
+        }
+    };
     // #285: unbuffered when the drive is read anyway and the file cache could not keep the experts for the next
     // start either (a 64 GB PC); otherwise the buffered readers, which a warm restart serves from the cache
     std::vector<std::string> files;
@@ -2836,22 +2951,52 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     const bool unbuffered = experts_unbuffered(files, want + (uint64_t) blob, why);
     const int readers = unbuffered ? std::max(threads, 16) : threads;   // 16 keep a PCIe 5 drive's queue full
     LoadStats st;
-    if (from_gguf) {
-        st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered);
+    if (place_.empty()) {
+        if (from_gguf) {
+            st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered);
+        } else {
+            if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20);
+            if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
+                st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20);
+        }
+    } else if (from_gguf) {
+        struct DstCtx {
+            const uint8_t* base[2];
+            const ExpertPlacement* place;
+            const std::vector<uint64_t>* off;
+            int64_t n_expert;
+        };
+        DstCtx ctx{{(const uint8_t*) ((PinnedArena*) arena_[0])->data(),
+                    (const uint8_t*) ((PinnedArena*) arena_[1])->data()},
+                   &place_, &local_off_, n_expert};
+        st = load_experts_gguf(gguf_, nullptr, lay, readers, unbuffered,
+                               [](void* c, int64_t l, int64_t e, uint64_t role_off) -> uint8_t* {
+                                   DstCtx& x = *(DstCtx*) c;
+                                   const int nd = x.place->node_of(l, e);
+                                   return (uint8_t*) x.base[nd] + (*x.off)[(size_t) (l * x.n_expert + e)] + role_off;
+                               },
+                               &ctx);
     } else {
-        if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20);
-        if (!unbuffered || (!st.ok && st.error.empty()))   // unaligned ranges: the buffered reader
-            st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20);
+        std::vector<ScatterRange> ranges;
+        ranges.reserve((size_t) (n_layers * n_expert));
+        for (int64_t l = 0; l < n_layers; ++l)
+            for (int64_t e = 0; e < n_expert; ++e) {
+                const int nd = place_.node_of(l, e);
+                ranges.push_back({lay.blob_offset(l, e), lay.blob_bytes(l),
+                                  (uint8_t*) ((PinnedArena*) arena_[nd])->data() +
+                                      local_off_[(size_t) (l * n_expert + e)]});
+            }
+        st = load_experts_scatter(path, ranges, readers);
     }
     std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",
                  why.c_str());
     if (!st.ok) {
-        delete a;
+        drop_arenas();
         err = "ArenaExpertSource: the expert load was refused: " + (st.error.empty() ? std::string("unknown") : st.error);
         return false;
     }
     if (st.bytes != want) {
-        delete a;
+        drop_arenas();
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
     }
@@ -2868,7 +3013,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     if (arena_mmap && from_gguf && room) {
         const std::string tmp = path + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
-        bool ok = f != nullptr && std::fwrite(a->data(), 1, (size_t) want, f) == (size_t) want;
+        bool ok = f != nullptr && std::fwrite(((PinnedArena*) arena_[0])->data(), 1, (size_t) want, f) == (size_t) want;
         if (ok) {
             std::vector<uint8_t> pad((size_t) blob, 0);
             ok = std::fwrite(pad.data(), 1, pad.size(), f) == pad.size();
@@ -2879,28 +3024,47 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: %s %s (the next start maps it)\n",
                      ok ? "wrote" : "could NOT write", path.c_str());
     }
-    arena_ = a;
-    base_ = a->data();
-    pinned_bytes_ = a->registered_bytes;
-    // plan v0.3 P6: device aliases of the mapped registration, for the PCIe share of the misses
-    dev_slice_.clear();
-    slice_bytes_ = a->slice_bytes;
-    if (a->registered_bytes > 0) {
-        std::vector<uint64_t> starts = a->slice_bytes > 0 ? a->slice_starts : std::vector<uint64_t>{0};
-        for (uint64_t off : starts) {
-            void* d = nullptr;
-            if (cudaHostGetDevicePointer(&d, (void*) (base_ + off), 0) != cudaSuccess) {
-                (void) cudaGetLastError();
-                dev_slice_.clear();
-                break;
+    if (place_.empty()) {
+        PinnedArena* a0 = (PinnedArena*) arena_[0];
+        base_[0] = a0->data();
+        pinned_bytes_[0] = a0->registered_bytes;
+        dev_slice_[0].clear();
+        slice_bytes_[0] = a0->slice_bytes;
+        if (a0->registered_bytes > 0) {
+            std::vector<uint64_t> starts = a0->slice_bytes > 0 ? a0->slice_starts : std::vector<uint64_t>{0};
+            for (uint64_t off : starts) {
+                void* d = nullptr;
+                if (cudaHostGetDevicePointer(&d, (void*) (base_[0] + off), 0) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    dev_slice_[0].clear();
+                    break;
+                }
+                dev_slice_[0].push_back((const uint8_t*) d);
             }
-            dev_slice_.push_back((const uint8_t*) d);
         }
+        note_ = a0->note;
+    } else {
+        for (int nd = 0; nd < 2; ++nd) {
+            PinnedArena* an = (PinnedArena*) arena_[nd];
+            base_[nd] = an->data();
+            pinned_bytes_[nd] = an->registered_bytes;
+            slice_bytes_[nd] = an->slice_bytes;
+            dev_slice_[nd].clear();
+            // A whole-range registration gives one device alias per node.  A sliced registration falls back to
+            // the DMA staging path (`device_alias` returns null), which is correct - just without the direct read.
+            if (an->registered_bytes > 0 && an->slice_bytes == 0) {
+                void* d = nullptr;
+                if (cudaHostGetDevicePointer(&d, (void*) base_[nd], 0) == cudaSuccess)
+                    dev_slice_[nd].push_back((const uint8_t*) d);
+                else
+                    (void) cudaGetLastError();
+            }
+        }
+        note_ = ((PinnedArena*) arena_[0])->note + "; node1: " + ((PinnedArena*) arena_[1])->note;
     }
     blobs_ = n_layers * n_expert;
     n_expert_ = n_expert;
     reads_ = 0;
-    note_ = a->note;
     gib_per_s_ = st.gib_per_second();
     load_seconds_ = st.seconds;
     load_read_s_ = st.read_seconds;
@@ -2914,11 +3078,19 @@ void ArenaExpertSource::close() {
 #endif
     map_ = nullptr;
     map_bytes_ = 0;
-    if (arena_ != nullptr) {
-        delete (PinnedArena*) arena_;
-        arena_ = nullptr;
+    for (int nd = 0; nd < 2; ++nd) {
+        if (arena_[nd] != nullptr) {
+            delete (PinnedArena*) arena_[nd];
+            arena_[nd] = nullptr;
+        }
+        base_[nd] = nullptr;
+        dev_slice_[nd].clear();
+        slice_bytes_[nd] = 0;
+        pinned_bytes_[nd] = 0;
+        node_bytes_[nd] = 0;
     }
-    base_ = nullptr;
+    place_ = ExpertPlacement{};
+    local_off_.clear();
     blobs_ = 0;
     n_expert_ = 0;
 }
@@ -2956,30 +3128,60 @@ uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
 #endif
 }
 
-bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
-    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
+const uint8_t* ArenaExpertSource::slot_of(int64_t layer, int64_t expert, uint64_t& local_off, int& node) const {
     const auto& lay = strata::kernels::cpu::expert_layout();
-    return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
+    if (place_.empty()) {
+        node = 0;
+        local_off = lay.blob_offset(layer, expert);
+        return base_[0];
+    }
+    node = place_.node_of(layer, expert);
+    const size_t idx = (size_t) (layer * n_expert_ + expert);
+    local_off = idx < local_off_.size() ? local_off_[idx] : 0;
+    return base_[node];
+}
+
+bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
+    if (layer < 0 || expert < 0 || expert >= n_expert_) return false;
+    uint64_t local = 0;
+    int node = 0;
+    if (slot_of(layer, expert, local, node) == nullptr) return false;
+    return local + strata::kernels::cpu::expert_layout().blob_bytes(layer) <= pinned_bytes_[node];
 }
 
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {
-    if (dev_slice_.empty() || !pinned(layer, expert)) return nullptr;
-    const auto& lay = strata::kernels::cpu::expert_layout();
-    if (slice_bytes_ == 0) return dev_slice_[0] + lay.blob_offset(layer, expert);
-    // one registration slice per layer
-    if ((size_t) layer >= dev_slice_.size()) return nullptr;
-    return dev_slice_[(size_t) layer] + (uint64_t) expert * lay.blob_bytes(layer);
+    if (layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
+    uint64_t local = 0;
+    int node = 0;
+    if (slot_of(layer, expert, local, node) == nullptr) return nullptr;
+    if (!pinned(layer, expert)) return nullptr;
+    if (place_.empty()) {
+        if (dev_slice_[0].empty()) return nullptr;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        if (slice_bytes_[0] == 0) return dev_slice_[0][0] + lay.blob_offset(layer, expert);
+        // one registration slice per layer
+        if ((size_t) layer >= dev_slice_[0].size()) return nullptr;
+        return dev_slice_[0][(size_t) layer] + (uint64_t) expert * lay.blob_bytes(layer);
+    }
+    // L1 partition: a whole-range registration gives one device alias per node; a sliced one falls back to the
+    // DMA staging path (`device_alias` null), which is correct - just without the direct read.
+    if (dev_slice_[node].empty() || slice_bytes_[node] != 0) return nullptr;
+    return dev_slice_[node][0] + local;
 }
 
 const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
-    if (base_ == nullptr) return nullptr;
+    if (base_[0] == nullptr && base_[1] == nullptr) return nullptr;
     if (layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_) return nullptr;
+    uint64_t local = 0;
+    int node = 0;
+    const uint8_t* p = slot_of(layer, expert, local, node);
+    if (p == nullptr) return nullptr;
     ++reads_;
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
     // this class over `FileExpertSource`.
-    return base_ + strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
+    return p + local;
 }
 
 }  // namespace strata::core
