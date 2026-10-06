@@ -1233,6 +1233,14 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+  # L1 NUMA: the two-node claim protocol under randomized batches, with synthetic kernels so it runs on any CPU
+  # (no AVX-512, no ggml submodule) and a watchdog that turns a stall into a failure.
+  add_executable(pool_numa_test src/kernels/cpu/pool_numa_test.cpp src/kernels/cpu/pool_numa_test_fakes.cpp
+                 src/kernels/cpu/pool.cpp)
+  target_include_directories(pool_numa_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(pool_numa_test PRIVATE Threads::Threads)
+  add_test(NAME pool_numa_test COMMAND pool_numa_test 2000)
+  set_tests_properties(pool_numa_test PROPERTIES TIMEOUT 120)
 
   if(UNIX AND NOT APPLE)
     add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
